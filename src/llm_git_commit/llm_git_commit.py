@@ -183,7 +183,11 @@ def register_commands(cli):
         "-y", "--yes", is_flag=True,
         help="Automatically confirm and proceed with the commit without interactive editing (uses LLM output directly)."
     )
-    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, max_chars_override, api_key_override, yes):
+    @click.option(
+        "--usage", "show_usage", is_flag=True,
+        help="Show token usage after LLM generation."
+    )
+    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, max_chars_override, api_key_override, yes, show_usage):
         """
         Generates Git commit messages using an LLM.
 
@@ -271,6 +275,20 @@ def register_commands(cli):
         try:
             response_obj = model_obj.prompt(diff_output, system=system_prompt)
             generated_message = response_obj.text().strip()
+
+            # Display token usage if requested
+            if show_usage:
+                try:
+                    usage = response_obj.usage()
+                    if usage:
+                        input_tokens = usage.get("input", usage.get("prompt_tokens", "?"))
+                        output_tokens = usage.get("output", usage.get("completion_tokens", "?"))
+                        total = "?"
+                        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+                            total = input_tokens + output_tokens
+                        click.echo(click.style(f"Token usage: {input_tokens} input, {output_tokens} output, {total} total", fg="cyan"))
+                except Exception:
+                    click.echo(click.style("Token usage: not available for this model", fg="yellow"))
         except Exception as e:
             click.echo(click.style(f"Error calling LLM: {e}", fg="red"))
             return
