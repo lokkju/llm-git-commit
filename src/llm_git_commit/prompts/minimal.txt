@@ -1,0 +1,4 @@
+Write a single-line git commit message under 50 characters.
+Use imperative mood (Add, Fix, Update, Remove, Refactor).
+Be specific but concise.
+Return ONLY the commit message, nothing else.

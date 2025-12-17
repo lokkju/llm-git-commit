@@ -1,0 +1,19 @@
+Write a git commit message with a gitmoji prefix.
+
+Common gitmojis:
+- ✨ New feature
+- 🐛 Bug fix
+- 📝 Documentation
+- 💄 UI/style changes
+- ♻️ Refactoring
+- ⚡ Performance
+- ✅ Tests
+- 🔧 Configuration
+- 🔥 Remove code/files
+- 🚀 Deploy/release
+
+Format: <emoji> Short description (under 50 chars after emoji)
+
+Example: ✨ Add user authentication module
+
+Return ONLY the commit message, nothing else.

@@ -6,21 +6,55 @@ from prompt_toolkit.patch_stdout import patch_stdout # Important for prompt_tool
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import Style
-from prompt_toolkit.key_binding import KeyBindings        
+from prompt_toolkit.key_binding import KeyBindings
 import os
 import json
 import tempfile
 import shutil
+from importlib import resources
+from pathlib import Path
 
 # ---  Configuration Management ---
 # This section handles loading and saving configuration.
-CONFIG_DIR = click.get_app_dir("llm-git-commit")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CONFIG_DIR = Path(click.get_app_dir("llm-git-commit"))
+CONFIG_FILE = CONFIG_DIR / "config.json"
+PROMPTS_DIR = CONFIG_DIR / "prompts"
 DEFAULT_MAX_CHARS = 15000
+DEFAULT_PROMPT_STYLE = "conventional"
+
+# Built-in prompt styles (names and descriptions only - content is in files)
+BUILTIN_PROMPT_STYLES = {
+    "conventional": "Conventional Commits format (feat:, fix:, etc.) [Default]",
+    "detailed": "Detailed multi-paragraph messages with context",
+    "minimal": "Short single-line messages only",
+    "semantic": "Semantic commits with scope: type(scope): description",
+    "gitmoji": "Gitmoji-style with emoji prefixes",
+    "custom": "Editable custom prompt - edit prompts/custom.txt to customize",
+}
+
+
+def ensure_prompts_installed():
+    """Ensure prompt files are installed to the config directory."""
+    if not PROMPTS_DIR.exists():
+        PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Copy prompts from package to config directory if they don't exist
+    try:
+        package_prompts = resources.files("llm_git_commit").joinpath("prompts")
+        for style_name in BUILTIN_PROMPT_STYLES:
+            dest_file = PROMPTS_DIR / f"{style_name}.txt"
+            if not dest_file.exists():
+                source_file = package_prompts.joinpath(f"{style_name}.txt")
+                if source_file.is_file():
+                    dest_file.write_text(source_file.read_text())
+    except Exception:
+        # If package resources aren't available, that's okay - user can create their own
+        pass
+
 
 def load_config():
     """Loads configuration from the JSON file."""
-    if not os.path.exists(CONFIG_FILE):
+    if not CONFIG_FILE.exists():
         return {}
     try:
         with open(CONFIG_FILE, 'r') as f:
@@ -28,141 +62,104 @@ def load_config():
     except (json.JSONDecodeError, IOError):
         return {}
 
+
 def save_config(config_data):
     """Saves configuration to the JSON file."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config_data, f, indent=2)
 
 
+def get_prompt_content(prompt_name: str) -> str | None:
+    """Load prompt content from file in config directory.
+
+    Returns the prompt text, or None if not found.
+    """
+    prompt_file = PROMPTS_DIR / f"{prompt_name}.txt"
+    if prompt_file.exists():
+        return prompt_file.read_text().strip()
+
+    # Fall back to package resources
+    try:
+        package_prompts = resources.files("llm_git_commit").joinpath("prompts")
+        source_file = package_prompts.joinpath(f"{prompt_name}.txt")
+        if source_file.is_file():
+            return source_file.read_text().strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def list_available_prompts() -> dict[str, str]:
+    """List all available prompt styles with descriptions."""
+    available = {}
+
+    # Start with built-in styles
+    for name, desc in BUILTIN_PROMPT_STYLES.items():
+        if get_prompt_content(name):
+            available[name] = desc
+
+    # Add any custom prompts in the prompts directory
+    if PROMPTS_DIR.exists():
+        for prompt_file in PROMPTS_DIR.glob("*.txt"):
+            name = prompt_file.stem
+            if name not in available:
+                available[name] = f"Custom prompt: {name}"
+
+    return available
+
+
 # --- System Prompt  ---
-DEFAULT_GIT_COMMIT_SYSTEM_PROMPT = """
-You are an expert programmer tasked with writing a concise and conventional git commit message.
-Analyze the provided 'git diff' output, which details specific code changes.
-Your goal is to create a commit message that SUCCINCTLY summarizes THESE CODE CHANGES.
-
-**Format Rules:**
-1.  **Conventional Commits:** Start with a type, followed by an optional scope, a colon, and a space. Then, a short, imperative-mood description of the change.
-    - Types: `feat` (new feature), `fix` (bug fix), `docs` (documentation), `style` (formatting), `refactor` (code structure), `test` (adding/improving tests), `chore` (build/tooling changes).
-    - Example: `feat: add user authentication module`
-    - Example: `fix(api): correct pagination error in user endpoint`
-    - Example: `chore: configure linting tools`
-2.  **Subject Line:** The first line (subject) MUST be 50 characters or less. It should summarize the most important aspect of the changes.
-3.  **Body (Optional):**
-    - If more detail is needed to explain the *what* and *why* of the code changes, add a SINGLE BLANK LINE after the subject.
-    - The body should consist of one or more paragraphs. Keep these concise and focused on the changes.
-    - Bullet points (using `-` or `*`) are acceptable in the body for listing multiple related changes.
-
-**Content Guidelines - CRITICAL:**
-- **Focus ONLY on the code modifications presented in the diff.**
-- If the diff adds new files (e.g., a new script, module, or entire plugin), describe the *primary purpose or core functionality these new files introduce* as a collective change.
-- **DO NOT:**
-    - Write a project description, a general list of features of the software, or a tutorial.
-    - Describe the *mere existence* of files (e.g., AVOID "Added llm_git_commit.py and pyproject.toml").
-    - Be overly verbose or conversational.
-    - List all functions or methods added unless they are critical to understanding the change at a high level.
-
-**Example Scenario: Adding a new plugin (like the one you might be committing now):**
-If the `git diff` output shows the initial files for a new "git-commit" plugin, a good commit message would look like this:
-
-feat: implement initial llm-git-commit plugin
-
-Provides core functionality for generating Git commit messages
-using an LLM based on repository changes.
-
-- Includes command structure for `llm git-commit`.
-- Implements logic for retrieving git diffs (staged/tracked).
-- Integrates LLM prompting for message generation.
-- Adds interactive editing of suggested messages.
-
-**Output Requirements:**
-Return ONLY the raw commit message text. Do not include any explanations, markdown formatting (like '```'), or any phrases like "Here's the commit message:".
-"""
-
-# --- Built-in Prompt Templates ---
-BUILTIN_PROMPTS = {
-    "conventional": {
-        "description": "Conventional Commits format (feat:, fix:, etc.) [Default]",
-        "prompt": DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
-    },
-    "detailed": {
-        "description": "Detailed multi-paragraph messages with context",
-        "prompt": """You are an expert programmer writing detailed git commit messages.
-Analyze the provided git diff and write a comprehensive commit message:
-
-**Format:**
-1. First line: concise summary under 50 characters, imperative mood
-2. Blank line
-3. Body: detailed explanation of what changed and why
-   - Explain the motivation for the change
-   - Describe any trade-offs or alternatives considered
-   - Use bullet points for multiple related changes
-
-**Content Guidelines:**
-- Focus on the code modifications in the diff
-- Explain both the "what" and the "why"
-- Keep paragraphs concise but informative
-
-Return ONLY the commit message text, no markdown formatting or explanations.""",
-    },
-    "minimal": {
-        "description": "Short single-line messages only",
-        "prompt": """Write a single-line git commit message under 50 characters.
-Use imperative mood (Add, Fix, Update, Remove, Refactor).
-Be specific but concise.
-Return ONLY the commit message, nothing else.""",
-    },
-    "semantic": {
-        "description": "Semantic commits with scope: type(scope): description",
-        "prompt": """Write a semantic commit message in the format: type(scope): description
-
-Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore
-Scope: the affected component/module in parentheses (optional but preferred)
-Description: imperative mood, under 50 characters total for the first line
-
-Examples:
-- feat(auth): add OAuth2 login support
-- fix(api): handle null response in user endpoint
-- refactor(db): simplify query builder interface
-
-Return ONLY the commit message, nothing else.""",
-    },
-    "gitmoji": {
-        "description": "Gitmoji-style with emoji prefixes",
-        "prompt": """Write a git commit message with a gitmoji prefix.
-
-Common gitmojis:
-- ✨ New feature
-- 🐛 Bug fix
-- 📝 Documentation
-- 💄 UI/style changes
-- ♻️ Refactoring
-- ⚡ Performance
-- ✅ Tests
-- 🔧 Configuration
-- 🔥 Remove code/files
-- 🚀 Deploy/release
-
-Format: <emoji> Short description (under 50 chars after emoji)
-
-Example: ✨ Add user authentication module
-
-Return ONLY the commit message, nothing else.""",
-    },
-}
+# Default prompt is loaded from files, but we keep a fallback for when files aren't available
+DEFAULT_GIT_COMMIT_SYSTEM_PROMPT = """You are an expert programmer tasked with writing a concise and conventional git commit message.
+Analyze the provided 'git diff' output and create a commit message following Conventional Commits format.
+Use type prefixes: feat, fix, docs, style, refactor, test, chore.
+Subject line under 50 characters, imperative mood.
+Optional body explaining what and why (not how).
+Return ONLY the commit message text, nothing else."""
 
 
-def list_builtin_prompts() -> dict:
-    """Return dict of prompt_id -> description."""
-    return {k: v["description"] for k, v in BUILTIN_PROMPTS.items()}
+def get_system_prompt(config: dict, prompt_style_override: str | None = None, system_override: str | None = None) -> str:
+    """Get the system prompt based on configuration and overrides.
 
+    Priority: system_override > prompt_style_override > config["prompt"] > default
 
-def get_builtin_prompt(prompt_id: str) -> str:
-    """Get prompt content by ID."""
-    if prompt_id not in BUILTIN_PROMPTS:
-        available = ", ".join(BUILTIN_PROMPTS.keys())
-        raise ValueError(f"Unknown prompt style: {prompt_id}. Available: {available}")
-    return BUILTIN_PROMPTS[prompt_id]["prompt"]
+    Prompts are loaded from text files in ~/.config/llm-git-commit/prompts/
+    """
+    # Explicit system prompt override (from -s flag)
+    if system_override:
+        return system_override
+
+    # Prompt style override (from -p/--prompt-style flag)
+    if prompt_style_override:
+        content = get_prompt_content(prompt_style_override)
+        if content:
+            return content
+        raise ValueError(f"Prompt style '{prompt_style_override}' not found. "
+                        f"Create {PROMPTS_DIR / prompt_style_override}.txt or use --list-prompts")
+
+    # Config-based prompt (a style name like "conventional", "custom", etc.)
+    config_prompt = config.get("prompt")
+    if config_prompt:
+        content = get_prompt_content(config_prompt)
+        if content:
+            return content
+
+    # Legacy: check for old "prompt-style" key
+    config_style = config.get("prompt-style")
+    if config_style:
+        content = get_prompt_content(config_style)
+        if content:
+            return content
+
+    # Default to conventional
+    content = get_prompt_content(DEFAULT_PROMPT_STYLE)
+    if content:
+        return content
+
+    # Absolute fallback
+    return DEFAULT_GIT_COMMIT_SYSTEM_PROMPT
 
 
 # --- Editor Override Support ---
@@ -330,13 +327,12 @@ def register_commands(cli):
     )
     @click.option(
         "-p", "--prompt-style", "prompt_style",
-        type=click.Choice(list(BUILTIN_PROMPTS.keys()), case_sensitive=False),
         default=None,
-        help="Use a built-in prompt style (conventional, detailed, minimal, semantic, gitmoji)."
+        help="Use a prompt style (conventional, detailed, minimal, semantic, gitmoji, or custom)."
     )
     @click.option(
         "--list-prompts", is_flag=True,
-        help="List available built-in prompt styles and exit."
+        help="List available prompt styles and exit."
     )
     @click.option(
         "--max-chars", "max_chars_override", type=int, default=None,
@@ -368,17 +364,22 @@ def register_commands(cli):
         if ctx.invoked_subcommand is not None:
             return
 
-        # Handle --list-prompts
-        if list_prompts:
-            click.echo("Available built-in prompt styles:\n")
-            for pid, desc in list_builtin_prompts().items():
-                marker = " (default)" if pid == "conventional" else ""
-                click.echo(f"  {click.style(pid, bold=True):20} {desc}{marker}")
-            click.echo("\nUsage: llm git-commit --prompt-style <style>")
-            click.echo("       llm git-commit config --prompt-style <style>  (set as default)")
-            return
+        # Ensure prompts are installed
+        ensure_prompts_installed()
 
         config = load_config()
+
+        # Handle --list-prompts
+        if list_prompts:
+            click.echo("Available prompt styles:\n")
+            current_prompt = config.get("prompt", DEFAULT_PROMPT_STYLE)
+            for pid, desc in list_available_prompts().items():
+                marker = " (current)" if pid == current_prompt else ""
+                click.echo(f"  {click.style(pid, bold=True):20} {desc}{marker}")
+            click.echo(f"\nPrompt files location: {PROMPTS_DIR}")
+            click.echo("\nUsage: llm git-commit --prompt-style <style>")
+            click.echo("       llm git-commit config --prompt <style>  (set as default)")
+            return
 
         #  Check if inside a Git repository
         if not _is_git_repository():
@@ -448,17 +449,12 @@ def register_commands(cli):
             diff_output = diff_output[:max_chars] + "\n\n... [diff truncated]"
 
         # --- Logic to determine the system prompt with config precedence ---
-        # Priority: -s custom > --prompt-style > config prompt-style > config system > default
-        if system_prompt_override:
-            system_prompt = system_prompt_override
-        elif prompt_style:
-            system_prompt = get_builtin_prompt(prompt_style)
-        elif config.get("prompt-style"):
-            system_prompt = get_builtin_prompt(config.get("prompt-style"))
-        elif config.get("system"):
-            system_prompt = config.get("system")
-        else:
-            system_prompt = DEFAULT_GIT_COMMIT_SYSTEM_PROMPT
+        try:
+            system_prompt = get_system_prompt(config, prompt_style, system_prompt_override)
+        except ValueError as e:
+            click.echo(click.style(f"Error: {e}", fg="red"))
+            click.echo("Use --list-prompts to see available styles.")
+            return
         
         click.echo(f"Generating commit message using {click.style(actual_model_id, bold=True)} based on {diff_description}...")
         
@@ -515,42 +511,92 @@ def register_commands(cli):
 
     # --- 'config' subcommand attached to the git_commit_command group ---
     @git_commit_command.command(name="config")
-    @click.option("--view", is_flag=True, help="View the current configuration.")
+    @click.option("--view", is_flag=True, help="View the current configuration (default if no options given).")
     @click.option("--reset", is_flag=True, help="Reset all configurations to default.")
     @click.option("-m", "--model", "model_config", default=None, help="Set the default model.")
-    @click.option("-s", "--system", "system_config", default=None, help="Set the default system prompt.")
-    @click.option("-p", "--prompt-style", "prompt_style_config",
-                  type=click.Choice(list(BUILTIN_PROMPTS.keys()), case_sensitive=False),
-                  default=None, help="Set the default prompt style.")
+    @click.option("-p", "--prompt", "prompt_config", default=None,
+                  help="Set the default prompt style (e.g., conventional, detailed, custom).")
     @click.option("-e", "--editor", "editor_config", default=None,
                   help="Set the default external editor (or 'none' to disable).")
     @click.option("--max-chars", "max_chars_config", type=int, default=None, help="Set the default max characters.")
+    @click.option("--show-prompt", is_flag=True, help="Show the full text of the current prompt.")
     @click.pass_context
-    def config_command(ctx, view, reset, model_config, system_config, prompt_style_config, editor_config, max_chars_config):
+    def config_command(ctx, view, reset, model_config, prompt_config, editor_config, max_chars_config, show_prompt):
         """
         View or set persistent default options for llm-git-commit.
-        
+
+        Prompts are stored as text files in the prompts directory.
+        Edit the files directly to customize, or create new ones.
+
         Examples:
         \b
-          llm git-commit config --view
+          llm git-commit config                    # Show current config
+          llm git-commit config --show-prompt      # Show current prompt text
           llm git-commit config --model gpt-4-turbo
-          llm git-commit config --max-chars 8000
+          llm git-commit config --prompt detailed
+          llm git-commit config --prompt custom    # Use prompts/custom.txt (edit it!)
+          llm git-commit config --prompt myproject # Use prompts/myproject.txt
+          llm git-commit config --editor vim
           llm git-commit config --reset
         """
+        # Ensure prompts are installed
+        ensure_prompts_installed()
+
         config_data = load_config()
 
-        if view:
-            click.echo(f"Configuration file location: {CONFIG_FILE}")
-            if config_data:
-                click.echo(json.dumps(config_data, indent=2))
+        # Default to --view if no options given
+        no_options = not any([reset, model_config, prompt_config,
+                              editor_config, max_chars_config, show_prompt])
+        if view or no_options:
+            click.echo(click.style("llm-git-commit configuration\n", bold=True))
+            click.echo(f"Config file:    {CONFIG_FILE}")
+            click.echo(f"Prompts dir:    {PROMPTS_DIR}")
+            click.echo("")
+
+            # Model
+            model = config_data.get("model", "(llm default)")
+            click.echo(f"Model:          {model}")
+
+            # Prompt
+            prompt_name = config_data.get("prompt", DEFAULT_PROMPT_STYLE)
+            desc = BUILTIN_PROMPT_STYLES.get(prompt_name, f"Custom: {prompt_name}")
+            prompt_file = PROMPTS_DIR / f"{prompt_name}.txt"
+            click.echo(f"Prompt:         {prompt_name} - {desc}")
+            click.echo(f"Prompt file:    {prompt_file}")
+
+            # Editor
+            editor = config_data.get("editor")
+            if editor:
+                click.echo(f"Editor:         {editor}")
             else:
-                click.echo("No configuration set.")
+                detected = get_external_editor()
+                click.echo(f"Editor:         (built-in prompt, detected: {detected or 'none'})")
+
+            # Max chars
+            max_chars = config_data.get("max-chars", DEFAULT_MAX_CHARS)
+            click.echo(f"Max chars:      {max_chars}")
+
+            click.echo("")
+            click.echo("Use --show-prompt to see the full prompt text.")
+            click.echo(f"Edit prompt files directly in: {PROMPTS_DIR}")
+            return
+
+        if show_prompt:
+            prompt_name = config_data.get("prompt", DEFAULT_PROMPT_STYLE)
+            prompt_file = PROMPTS_DIR / f"{prompt_name}.txt"
+            click.echo(click.style(f"Current prompt ({prompt_name}):\n", bold=True))
+            click.echo(click.style(f"File: {prompt_file}\n", fg="cyan"))
+            try:
+                prompt_text = get_system_prompt(config_data)
+                click.echo(prompt_text)
+            except ValueError as e:
+                click.echo(click.style(f"Error: {e}", fg="red"))
             return
 
         if reset:
             if click.confirm("Are you sure you want to reset all configurations?"):
-                if os.path.exists(CONFIG_FILE):
-                    os.remove(CONFIG_FILE)
+                if CONFIG_FILE.exists():
+                    CONFIG_FILE.unlink()
                 click.echo("Configuration has been reset.")
             else:
                 click.echo("Reset cancelled.")
@@ -561,27 +607,27 @@ def register_commands(cli):
             config_data["model"] = model_config
             click.echo(f"Default model set to: {model_config}")
             updates_made = True
-        
-        if system_config is not None:
-            config_data["system"] = system_config
-            # Clear prompt-style if setting a custom system prompt
-            if "prompt-style" in config_data:
-                del config_data["prompt-style"]
-            click.echo(f"Default system prompt set.")
-            updates_made = True
 
-        if prompt_style_config is not None:
-            config_data["prompt-style"] = prompt_style_config
-            # Clear custom system prompt if setting a prompt style
-            if "system" in config_data:
-                del config_data["system"]
-            click.echo(f"Default prompt style set to: {prompt_style_config}")
+        if prompt_config is not None:
+            # Validate the prompt file exists
+            if not get_prompt_content(prompt_config):
+                prompt_file = PROMPTS_DIR / f"{prompt_config}.txt"
+                click.echo(click.style(f"Error: Prompt '{prompt_config}' not found.", fg="red"))
+                click.echo(f"Create a prompt file at: {prompt_file}")
+                click.echo("Or use --list-prompts to see available styles.")
+                return
+            config_data["prompt"] = prompt_config
+            # Clear legacy keys
+            config_data.pop("prompt-style", None)
+            config_data.pop("system", None)
+            prompt_file = PROMPTS_DIR / f"{prompt_config}.txt"
+            click.echo(f"Default prompt set to: {prompt_config}")
+            click.echo(f"Edit the prompt at: {prompt_file}")
             updates_made = True
 
         if editor_config is not None:
             if editor_config.lower() == "none":
-                if "editor" in config_data:
-                    del config_data["editor"]
+                config_data.pop("editor", None)
                 click.echo("Default editor disabled (will use built-in prompt).")
             else:
                 config_data["editor"] = editor_config

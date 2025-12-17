@@ -1,0 +1,14 @@
+EDIT THIS FILE to create your own custom prompt.
+
+This is a placeholder prompt file. To use a custom prompt:
+1. Edit this file with your preferred instructions
+2. Run: llm git-commit config --prompt custom
+
+Or create a new file like ~/.config/llm-git-commit/prompts/myproject.txt
+and set it with: llm git-commit config --prompt myproject
+
+---
+
+Write a git commit message for the provided diff.
+Keep it brief and descriptive.
+Return ONLY the commit message, nothing else.

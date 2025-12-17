@@ -1,0 +1,12 @@
+Write a semantic commit message in the format: type(scope): description
+
+Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore
+Scope: the affected component/module in parentheses (optional but preferred)
+Description: imperative mood, under 50 characters total for the first line
+
+Examples:
+- feat(auth): add OAuth2 login support
+- fix(api): handle null response in user endpoint
+- refactor(db): simplify query builder interface
+
+Return ONLY the commit message, nothing else.
