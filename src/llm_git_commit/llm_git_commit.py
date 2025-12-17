@@ -9,6 +9,8 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.key_binding import KeyBindings        
 import os
 import json
+import tempfile
+import shutil
 
 # ---  Configuration Management ---
 # This section handles loading and saving configuration.
@@ -163,6 +165,75 @@ def get_builtin_prompt(prompt_id: str) -> str:
     return BUILTIN_PROMPTS[prompt_id]["prompt"]
 
 
+# --- Editor Override Support ---
+def get_external_editor() -> str | None:
+    """Get external editor from environment variables.
+
+    Priority: LLM_GIT_COMMIT_EDITOR > GIT_EDITOR > VISUAL > EDITOR
+    Returns None if no editor is configured.
+    """
+    # Check LLM_GIT_COMMIT_EDITOR first
+    editor = os.environ.get("LLM_GIT_COMMIT_EDITOR")
+    if editor:
+        return editor
+
+    # Check git config core.editor
+    try:
+        result = subprocess.run(
+            ["git", "config", "core.editor"],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except FileNotFoundError:
+        pass
+
+    # Fall back to standard editor environment variables
+    return os.environ.get("VISUAL") or os.environ.get("EDITOR")
+
+
+def edit_with_external_editor(initial_text: str, editor: str) -> str | None:
+    """Open an external editor to edit the commit message.
+
+    Returns the edited text, or None if the user cancelled.
+    """
+    # Create a temporary file with the initial text
+    help_text = """
+# Edit your commit message above.
+# Lines starting with '#' will be ignored.
+# Save and close the editor to proceed.
+# Leave the message empty to cancel the commit.
+"""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(initial_text)
+        f.write("\n")
+        f.write(help_text)
+        temp_path = f.name
+
+    try:
+        # Open the editor
+        result = subprocess.run([editor, temp_path], check=False)
+        if result.returncode != 0:
+            click.echo(click.style(f"Editor exited with code {result.returncode}", fg="yellow"))
+            return None
+
+        # Read the edited content
+        with open(temp_path, 'r') as f:
+            content = f.read()
+
+        # Strip comment lines and trailing whitespace
+        lines = [line for line in content.splitlines() if not line.startswith('#')]
+        edited_text = '\n'.join(lines).strip()
+
+        return edited_text if edited_text else None
+    finally:
+        # Clean up the temporary file
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
 # System Prompts for Chat Refinement
 CHAT_REFINEMENT_SYSTEM_PROMPT_TEMPLATE = """
 You are an expert AI programmer specializing in crafting concise, conventional, and high-quality Git commit messages. Your primary objective is to assist the user in refining their current working draft of a commit message through an interactive dialogue, prioritizing their specific requests for content and style.
@@ -280,10 +351,14 @@ def register_commands(cli):
         help="Automatically confirm and proceed with the commit without interactive editing (uses LLM output directly)."
     )
     @click.option(
+        "-e", "--editor", "use_external_editor", is_flag=True,
+        help="Use external editor instead of built-in prompt. Uses $LLM_GIT_COMMIT_EDITOR, git config core.editor, $VISUAL, or $EDITOR."
+    )
+    @click.option(
         "--usage", "show_usage", is_flag=True,
         help="Show token usage after LLM generation."
     )
-    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, show_usage):
+    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, use_external_editor, show_usage):
         """
         Generates Git commit messages using an LLM.
 
@@ -420,6 +495,15 @@ def register_commands(cli):
             final_message = generated_message
             click.echo(click.style("\nUsing LLM-generated message directly:", fg="cyan"))
             click.echo(f'"""\n{final_message}\n"""')
+        elif use_external_editor or config.get("editor"):
+            # Use external editor instead of built-in prompt
+            # Priority: -e flag triggers lookup, config["editor"] provides default
+            editor = config.get("editor") or get_external_editor()
+            if not editor:
+                click.echo(click.style("Error: No editor found. Set $LLM_GIT_COMMIT_EDITOR, $VISUAL, or $EDITOR, or use 'llm git-commit config --editor <editor>'.", fg="red"))
+                return
+            click.echo(click.style(f"\nOpening {editor} to edit commit message...", fg="cyan"))
+            final_message = edit_with_external_editor(generated_message, editor)
         else:
             final_message = _interactive_edit_message(generated_message, diff_output, model_obj)
 
@@ -438,9 +522,11 @@ def register_commands(cli):
     @click.option("-p", "--prompt-style", "prompt_style_config",
                   type=click.Choice(list(BUILTIN_PROMPTS.keys()), case_sensitive=False),
                   default=None, help="Set the default prompt style.")
+    @click.option("-e", "--editor", "editor_config", default=None,
+                  help="Set the default external editor (or 'none' to disable).")
     @click.option("--max-chars", "max_chars_config", type=int, default=None, help="Set the default max characters.")
     @click.pass_context
-    def config_command(ctx, view, reset, model_config, system_config, prompt_style_config, max_chars_config):
+    def config_command(ctx, view, reset, model_config, system_config, prompt_style_config, editor_config, max_chars_config):
         """
         View or set persistent default options for llm-git-commit.
         
@@ -490,6 +576,16 @@ def register_commands(cli):
             if "system" in config_data:
                 del config_data["system"]
             click.echo(f"Default prompt style set to: {prompt_style_config}")
+            updates_made = True
+
+        if editor_config is not None:
+            if editor_config.lower() == "none":
+                if "editor" in config_data:
+                    del config_data["editor"]
+                click.echo("Default editor disabled (will use built-in prompt).")
+            else:
+                config_data["editor"] = editor_config
+                click.echo(f"Default editor set to: {editor_config}")
             updates_made = True
 
         if max_chars_config is not None:
