@@ -389,7 +389,7 @@ def register_commands(cli):
         help="Use external editor. Without value: detect from env. With value: use that command."
     )
     @click.option(
-        "--usage", "show_usage", is_flag=True,
+        "--usage/--no-usage", "show_usage", default=None,
         help="Show token usage after LLM generation."
     )
     def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, editor_override, show_usage):
@@ -500,8 +500,9 @@ def register_commands(cli):
             response_obj = model_obj.prompt(diff_output, system=system_prompt)
             generated_message = response_obj.text().strip()
 
-            # Display token usage if requested
-            if show_usage:
+            # Display token usage if requested (CLI overrides config)
+            display_usage = show_usage if show_usage is not None else config.get("usage", False)
+            if display_usage:
                 try:
                     usage = response_obj.usage()
                     if usage:
@@ -568,9 +569,11 @@ def register_commands(cli):
     @click.option("-e", "--editor", "editor_config", default=None,
                   help="Set editor: 'internal' (built-in), 'env' (from environment), or a command.")
     @click.option("--max-chars", "max_chars_config", type=int, default=None, help="Set the default max characters.")
+    @click.option("--usage/--no-usage", "usage_config", default=None,
+                  help="Enable/disable token usage display by default.")
     @click.option("--show-prompt", is_flag=True, help="Show the full text of the current prompt.")
     @click.pass_context
-    def config_command(ctx, view, reset, model_config, prompt_config, editor_config, max_chars_config, show_prompt):
+    def config_command(ctx, view, reset, model_config, prompt_config, editor_config, max_chars_config, usage_config, show_prompt):
         """
         View or set persistent default options for llm-git-commit.
 
@@ -602,7 +605,7 @@ def register_commands(cli):
 
         # Default to --view if no options given
         no_options = not any([reset, model_config, prompt_config,
-                              editor_config, max_chars_config, show_prompt])
+                              editor_config, max_chars_config, usage_config is not None, show_prompt])
         if view or no_options:
             click.echo(click.style("llm-git-commit configuration\n", bold=True))
             click.echo(f"Config file:    {CONFIG_FILE}")
@@ -635,6 +638,10 @@ def register_commands(cli):
             # Max chars
             max_chars = config_data.get("max-chars", DEFAULT_MAX_CHARS)
             click.echo(f"Max chars:      {max_chars}")
+
+            # Usage
+            usage_enabled = config_data.get("usage", False)
+            click.echo(f"Show usage:     {usage_enabled}")
 
             click.echo("")
             click.echo("Use --show-prompt to see the full prompt text.")
@@ -705,6 +712,11 @@ def register_commands(cli):
         if max_chars_config is not None:
             config_data["max-chars"] = max_chars_config
             click.echo(f"Default max-chars set to: {max_chars_config}")
+            updates_made = True
+
+        if usage_config is not None:
+            config_data["usage"] = usage_config
+            click.echo(f"Show usage set to: {usage_config}")
             updates_made = True
 
         if updates_made:
