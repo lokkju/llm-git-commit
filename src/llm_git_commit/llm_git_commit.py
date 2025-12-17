@@ -77,7 +77,93 @@ using an LLM based on repository changes.
 Return ONLY the raw commit message text. Do not include any explanations, markdown formatting (like '```'), or any phrases like "Here's the commit message:".
 """
 
-# System Prompts for Chat Refinement 
+# --- Built-in Prompt Templates ---
+BUILTIN_PROMPTS = {
+    "conventional": {
+        "description": "Conventional Commits format (feat:, fix:, etc.) [Default]",
+        "prompt": DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
+    },
+    "detailed": {
+        "description": "Detailed multi-paragraph messages with context",
+        "prompt": """You are an expert programmer writing detailed git commit messages.
+Analyze the provided git diff and write a comprehensive commit message:
+
+**Format:**
+1. First line: concise summary under 50 characters, imperative mood
+2. Blank line
+3. Body: detailed explanation of what changed and why
+   - Explain the motivation for the change
+   - Describe any trade-offs or alternatives considered
+   - Use bullet points for multiple related changes
+
+**Content Guidelines:**
+- Focus on the code modifications in the diff
+- Explain both the "what" and the "why"
+- Keep paragraphs concise but informative
+
+Return ONLY the commit message text, no markdown formatting or explanations.""",
+    },
+    "minimal": {
+        "description": "Short single-line messages only",
+        "prompt": """Write a single-line git commit message under 50 characters.
+Use imperative mood (Add, Fix, Update, Remove, Refactor).
+Be specific but concise.
+Return ONLY the commit message, nothing else.""",
+    },
+    "semantic": {
+        "description": "Semantic commits with scope: type(scope): description",
+        "prompt": """Write a semantic commit message in the format: type(scope): description
+
+Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore
+Scope: the affected component/module in parentheses (optional but preferred)
+Description: imperative mood, under 50 characters total for the first line
+
+Examples:
+- feat(auth): add OAuth2 login support
+- fix(api): handle null response in user endpoint
+- refactor(db): simplify query builder interface
+
+Return ONLY the commit message, nothing else.""",
+    },
+    "gitmoji": {
+        "description": "Gitmoji-style with emoji prefixes",
+        "prompt": """Write a git commit message with a gitmoji prefix.
+
+Common gitmojis:
+- ✨ New feature
+- 🐛 Bug fix
+- 📝 Documentation
+- 💄 UI/style changes
+- ♻️ Refactoring
+- ⚡ Performance
+- ✅ Tests
+- 🔧 Configuration
+- 🔥 Remove code/files
+- 🚀 Deploy/release
+
+Format: <emoji> Short description (under 50 chars after emoji)
+
+Example: ✨ Add user authentication module
+
+Return ONLY the commit message, nothing else.""",
+    },
+}
+
+
+def list_builtin_prompts() -> dict:
+    """Return dict of prompt_id -> description."""
+    return {k: v["description"] for k, v in BUILTIN_PROMPTS.items()}
+
+
+def get_builtin_prompt(prompt_id: str) -> str:
+    """Get prompt content by ID."""
+    if prompt_id not in BUILTIN_PROMPTS:
+        available = ", ".join(BUILTIN_PROMPTS.keys())
+        raise ValueError(f"Unknown prompt style: {prompt_id}. Available: {available}")
+    return BUILTIN_PROMPTS[prompt_id]["prompt"]
+
+
+# System Prompts for Chat Refinement
 CHAT_REFINEMENT_SYSTEM_PROMPT_TEMPLATE = """
 You are an expert AI programmer specializing in crafting concise, conventional, and high-quality Git commit messages. Your primary objective is to assist the user in refining their current working draft of a commit message through an interactive dialogue, prioritizing their specific requests for content and style.
 
@@ -172,6 +258,16 @@ def register_commands(cli):
         help="Custom system prompt to override the default."
     )
     @click.option(
+        "-p", "--prompt-style", "prompt_style",
+        type=click.Choice(list(BUILTIN_PROMPTS.keys()), case_sensitive=False),
+        default=None,
+        help="Use a built-in prompt style (conventional, detailed, minimal, semantic, gitmoji)."
+    )
+    @click.option(
+        "--list-prompts", is_flag=True,
+        help="List available built-in prompt styles and exit."
+    )
+    @click.option(
         "--max-chars", "max_chars_override", type=int, default=None,
         help="Set max characters for the diff sent to the LLM."
     )
@@ -187,7 +283,7 @@ def register_commands(cli):
         "--usage", "show_usage", is_flag=True,
         help="Show token usage after LLM generation."
     )
-    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, max_chars_override, api_key_override, yes, show_usage):
+    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, show_usage):
         """
         Generates Git commit messages using an LLM.
 
@@ -197,7 +293,16 @@ def register_commands(cli):
         if ctx.invoked_subcommand is not None:
             return
 
-        
+        # Handle --list-prompts
+        if list_prompts:
+            click.echo("Available built-in prompt styles:\n")
+            for pid, desc in list_builtin_prompts().items():
+                marker = " (default)" if pid == "conventional" else ""
+                click.echo(f"  {click.style(pid, bold=True):20} {desc}{marker}")
+            click.echo("\nUsage: llm git-commit --prompt-style <style>")
+            click.echo("       llm git-commit config --prompt-style <style>  (set as default)")
+            return
+
         config = load_config()
 
         #  Check if inside a Git repository
@@ -268,7 +373,17 @@ def register_commands(cli):
             diff_output = diff_output[:max_chars] + "\n\n... [diff truncated]"
 
         # --- Logic to determine the system prompt with config precedence ---
-        system_prompt = system_prompt_override or config.get("system") or DEFAULT_GIT_COMMIT_SYSTEM_PROMPT
+        # Priority: -s custom > --prompt-style > config prompt-style > config system > default
+        if system_prompt_override:
+            system_prompt = system_prompt_override
+        elif prompt_style:
+            system_prompt = get_builtin_prompt(prompt_style)
+        elif config.get("prompt-style"):
+            system_prompt = get_builtin_prompt(config.get("prompt-style"))
+        elif config.get("system"):
+            system_prompt = config.get("system")
+        else:
+            system_prompt = DEFAULT_GIT_COMMIT_SYSTEM_PROMPT
         
         click.echo(f"Generating commit message using {click.style(actual_model_id, bold=True)} based on {diff_description}...")
         
@@ -320,9 +435,12 @@ def register_commands(cli):
     @click.option("--reset", is_flag=True, help="Reset all configurations to default.")
     @click.option("-m", "--model", "model_config", default=None, help="Set the default model.")
     @click.option("-s", "--system", "system_config", default=None, help="Set the default system prompt.")
+    @click.option("-p", "--prompt-style", "prompt_style_config",
+                  type=click.Choice(list(BUILTIN_PROMPTS.keys()), case_sensitive=False),
+                  default=None, help="Set the default prompt style.")
     @click.option("--max-chars", "max_chars_config", type=int, default=None, help="Set the default max characters.")
     @click.pass_context
-    def config_command(ctx, view, reset, model_config, system_config, max_chars_config):
+    def config_command(ctx, view, reset, model_config, system_config, prompt_style_config, max_chars_config):
         """
         View or set persistent default options for llm-git-commit.
         
@@ -360,9 +478,20 @@ def register_commands(cli):
         
         if system_config is not None:
             config_data["system"] = system_config
+            # Clear prompt-style if setting a custom system prompt
+            if "prompt-style" in config_data:
+                del config_data["prompt-style"]
             click.echo(f"Default system prompt set.")
             updates_made = True
-            
+
+        if prompt_style_config is not None:
+            config_data["prompt-style"] = prompt_style_config
+            # Clear custom system prompt if setting a prompt style
+            if "system" in config_data:
+                del config_data["system"]
+            click.echo(f"Default prompt style set to: {prompt_style_config}")
+            updates_made = True
+
         if max_chars_config is not None:
             config_data["max-chars"] = max_chars_config
             click.echo(f"Default max-chars set to: {max_chars_config}")
