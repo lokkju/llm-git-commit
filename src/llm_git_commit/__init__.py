@@ -162,12 +162,17 @@ def get_system_prompt(config: dict, prompt_style_override: str | None = None, sy
     return DEFAULT_GIT_COMMIT_SYSTEM_PROMPT
 
 
-# --- Editor Override Support ---
-def get_external_editor() -> str | None:
-    """Get external editor from environment variables.
+# --- Editor Configuration ---
+# Editor modes:
+#   "internal" (default) - use built-in prompt_toolkit editor
+#   "env" - detect from environment (LLM_GIT_COMMIT_EDITOR > git config > VISUAL > EDITOR)
+#   "<command>" - use specific editor command (e.g., "vim", "code --wait")
 
-    Priority: LLM_GIT_COMMIT_EDITOR > GIT_EDITOR > VISUAL > EDITOR
-    Returns None if no editor is configured.
+def get_editor_from_env() -> str | None:
+    """Get editor from environment variables.
+
+    Priority: LLM_GIT_COMMIT_EDITOR > git config core.editor > VISUAL > EDITOR
+    Returns None if no editor is found.
     """
     # Check LLM_GIT_COMMIT_EDITOR first
     editor = os.environ.get("LLM_GIT_COMMIT_EDITOR")
@@ -187,6 +192,39 @@ def get_external_editor() -> str | None:
 
     # Fall back to standard editor environment variables
     return os.environ.get("VISUAL") or os.environ.get("EDITOR")
+
+
+def resolve_editor(config: dict, use_external_flag: bool = False) -> tuple[str, str | None]:
+    """Resolve which editor to use based on config and flags.
+
+    Args:
+        config: Configuration dict
+        use_external_flag: Whether -e/--editor flag was passed without value
+
+    Returns:
+        Tuple of (mode, editor_command):
+        - ("internal", None) - use built-in prompt_toolkit
+        - ("env", "vim") - using editor from environment
+        - ("command", "code --wait") - using specific command
+    """
+    editor_config = config.get("editor", "internal")
+
+    # -e flag without value means use env
+    if use_external_flag and editor_config == "internal":
+        editor_config = "env"
+
+    if editor_config == "internal":
+        return ("internal", None)
+
+    if editor_config == "env":
+        env_editor = get_editor_from_env()
+        if env_editor:
+            return ("env", env_editor)
+        # No env editor found, fall back to internal
+        return ("internal", None)
+
+    # Specific command
+    return ("command", editor_config)
 
 
 def edit_with_external_editor(initial_text: str, editor: str) -> str | None:
@@ -347,14 +385,14 @@ def register_commands(cli):
         help="Automatically confirm and proceed with the commit without interactive editing (uses LLM output directly)."
     )
     @click.option(
-        "-e", "--editor", "use_external_editor", is_flag=True,
-        help="Use external editor instead of built-in prompt. Uses $LLM_GIT_COMMIT_EDITOR, git config core.editor, $VISUAL, or $EDITOR."
+        "-e", "--editor", "editor_override", is_flag=False, flag_value="env", default=None,
+        help="Use external editor. Without value: detect from env. With value: use that command."
     )
     @click.option(
         "--usage", "show_usage", is_flag=True,
         help="Show token usage after LLM generation."
     )
-    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, use_external_editor, show_usage):
+    def git_commit_command(ctx, diff_mode, model_id_override, system_prompt_override, prompt_style, list_prompts, max_chars_override, api_key_override, yes, editor_override, show_usage):
         """
         Generates Git commit messages using an LLM.
 
@@ -491,17 +529,28 @@ def register_commands(cli):
             final_message = generated_message
             click.echo(click.style("\nUsing LLM-generated message directly:", fg="cyan"))
             click.echo(f'"""\n{final_message}\n"""')
-        elif use_external_editor or config.get("editor"):
-            # Use external editor instead of built-in prompt
-            # Priority: -e flag triggers lookup, config["editor"] provides default
-            editor = config.get("editor") or get_external_editor()
-            if not editor:
-                click.echo(click.style("Error: No editor found. Set $LLM_GIT_COMMIT_EDITOR, $VISUAL, or $EDITOR, or use 'llm git-commit config --editor <editor>'.", fg="red"))
-                return
-            click.echo(click.style(f"\nOpening {editor} to edit commit message...", fg="cyan"))
-            final_message = edit_with_external_editor(generated_message, editor)
         else:
-            final_message = _interactive_edit_message(generated_message, diff_output, model_obj)
+            # Determine editor mode
+            # CLI override takes precedence
+            if editor_override:
+                if editor_override == "env":
+                    editor_mode, editor_cmd = "env", get_editor_from_env()
+                elif editor_override == "internal":
+                    editor_mode, editor_cmd = "internal", None
+                else:
+                    editor_mode, editor_cmd = "command", editor_override
+            else:
+                editor_mode, editor_cmd = resolve_editor(config)
+
+            if editor_mode == "internal":
+                final_message = _interactive_edit_message(generated_message, diff_output, model_obj)
+            elif editor_cmd:
+                click.echo(click.style(f"\nOpening {editor_cmd} to edit commit message...", fg="cyan"))
+                final_message = edit_with_external_editor(generated_message, editor_cmd)
+            else:
+                # env mode but no editor found
+                click.echo(click.style("Warning: No external editor found in environment. Using built-in editor.", fg="yellow"))
+                final_message = _interactive_edit_message(generated_message, diff_output, model_obj)
 
         if final_message is None or not final_message.strip():
             click.echo("Commit aborted.")
@@ -517,7 +566,7 @@ def register_commands(cli):
     @click.option("-p", "--prompt", "prompt_config", default=None,
                   help="Set the default prompt style (e.g., conventional, detailed, custom).")
     @click.option("-e", "--editor", "editor_config", default=None,
-                  help="Set the default external editor (or 'none' to disable).")
+                  help="Set editor: 'internal' (built-in), 'env' (from environment), or a command.")
     @click.option("--max-chars", "max_chars_config", type=int, default=None, help="Set the default max characters.")
     @click.option("--show-prompt", is_flag=True, help="Show the full text of the current prompt.")
     @click.pass_context
@@ -528,6 +577,12 @@ def register_commands(cli):
         Prompts are stored as text files in the prompts directory.
         Edit the files directly to customize, or create new ones.
 
+        Editor options:
+        \b
+          internal  - Built-in prompt_toolkit editor (default)
+          env       - Detect from $LLM_GIT_COMMIT_EDITOR, git config, $VISUAL, $EDITOR
+          <command> - Specific command like 'vim', 'code --wait', 'nano'
+
         Examples:
         \b
           llm git-commit config                    # Show current config
@@ -535,8 +590,9 @@ def register_commands(cli):
           llm git-commit config --model gpt-4-turbo
           llm git-commit config --prompt detailed
           llm git-commit config --prompt custom    # Use prompts/custom.txt (edit it!)
-          llm git-commit config --prompt myproject # Use prompts/myproject.txt
-          llm git-commit config --editor vim
+          llm git-commit config --editor internal  # Use built-in editor (default)
+          llm git-commit config --editor env       # Use editor from environment
+          llm git-commit config --editor vim       # Use specific editor
           llm git-commit config --reset
         """
         # Ensure prompts are installed
@@ -565,12 +621,16 @@ def register_commands(cli):
             click.echo(f"Prompt file:    {prompt_file}")
 
             # Editor
-            editor = config_data.get("editor")
-            if editor:
-                click.echo(f"Editor:         {editor}")
+            editor_config = config_data.get("editor", "internal")
+            env_editor = get_editor_from_env()
+            if editor_config == "internal":
+                click.echo(f"Editor:         internal (built-in prompt_toolkit)")
+            elif editor_config == "env":
+                click.echo(f"Editor:         env -> {env_editor or '(not found, will use internal)'}")
             else:
-                detected = get_external_editor()
-                click.echo(f"Editor:         (built-in prompt, detected: {detected or 'none'})")
+                click.echo(f"Editor:         {editor_config}")
+            if env_editor:
+                click.echo(f"Env editor:     {env_editor}")
 
             # Max chars
             max_chars = config_data.get("max-chars", DEFAULT_MAX_CHARS)
@@ -626,12 +686,20 @@ def register_commands(cli):
             updates_made = True
 
         if editor_config is not None:
-            if editor_config.lower() == "none":
-                config_data.pop("editor", None)
-                click.echo("Default editor disabled (will use built-in prompt).")
+            editor_val = editor_config.lower()
+            if editor_val == "internal":
+                config_data["editor"] = "internal"
+                click.echo("Editor set to: internal (built-in prompt_toolkit)")
+            elif editor_val == "env":
+                config_data["editor"] = "env"
+                env_editor = get_editor_from_env()
+                if env_editor:
+                    click.echo(f"Editor set to: env (currently: {env_editor})")
+                else:
+                    click.echo("Editor set to: env (no editor found in environment, will fall back to internal)")
             else:
                 config_data["editor"] = editor_config
-                click.echo(f"Default editor set to: {editor_config}")
+                click.echo(f"Editor set to: {editor_config}")
             updates_made = True
 
         if max_chars_config is not None:
